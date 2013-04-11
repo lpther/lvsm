@@ -33,6 +33,7 @@ import subprocess
 import __init__ as appinfo
 import lvsm
 import utils
+# comment
 
 
 def usage(code, msg=''):
