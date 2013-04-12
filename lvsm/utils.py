@@ -101,7 +101,6 @@ def gethostname(host):
     else:
         return hostip
 
-
 def pager(lines):
     """print lines to screen and mimic behaviour of MORE command"""
     global ROWS
@@ -143,10 +142,10 @@ def update_rows_cols():
         ROWS, COLS = s.split()
 
 
-def check_output(args):
+def check_output(args,shell=False):
     """Wrapper for subprocess.check_output"""
     try:
-        output = subprocess.check_output(args)
+        output = subprocess.check_output(args,shell=shell)
         return output
     # python 2.6 compatibility code
     except AttributeError as e:
