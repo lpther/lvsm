@@ -29,13 +29,40 @@ class GenericDirector(object):
                  configfile='', restart_cmd='', nodes=''):
         self.maintenance_dir = maintenance_dir
         self.ipvsadm = ipvsadm
+
         self.configfile = configfile
+	self.configfilename = configfile.split("/")[-1]
+	self.configdir = "/".join(configfile.split("/")[:-1]) + "/lvsm/"
+
         self.restart_cmd = restart_cmd
+
+        self.hostname = socket.gethostname()
         if nodes != '':
             self.nodes = nodes.replace(' ', '').split(',')
         else:
-            self.nodes = None
-        self.hostname = socket.gethostname()
+            self.nodes = [self.hostname]
+
+	if self.hostname not in self.nodes:
+		print "[ERROR] Current node not listed in nodes list"
+		sys.exit(1)
+
+    def getconfigfile(self):
+	"""
+	Returns the configfile
+	"""
+	return self.configfile
+
+    def getconfigdir(self):
+	"""
+	Returns the configdir
+	"""
+	return self.configdir
+
+    def getconfigfilename(self):
+	"""
+	Returns the configfilename
+	"""
+	return self.configfilename
 
     def disable(self, host, port='', reason=''):
         """
