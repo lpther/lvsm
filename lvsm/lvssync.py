@@ -1,7 +1,48 @@
 """
 ipvs sync library
+
+Use this library to send mcast messages to a group of LVS servers to 
+synchronize therr client tables. The number of connections per second
+can be tuned to prevent choking servers/upsetting network people.
+
+For what type of environment is it designed:
+-Direct Routing LVS cluster
+-Symmetric cluster
+-Any number of nodes
+
+What is not implemented:
+-Connection parameters
+-fwmark
+-Extensive debugging options
+-ipv6
+-Connection options are not changable (fixed at updating/adding
+ a connection)
+-No real validation of input data
+-No real error handling
+
+What is not tested:
+-MASQ,TUNNEL modes
+
+examples:
+$ LVSSYNCMODE=testsend LVSSYNCINT=eth0 python lvssync.py
+Sending 3 connections should take around 2 sec at 1 connections/sec
+... Sending time was 2.00 sec
+
+$ LVSSYNCINT=eth0 python lvssync.py                                                                                                                                                                                          
+Bound to 0.0.0.0:8848, joined group 224.0.0.81 on interface eth0 (192.168.1.1) 
+syncid pro  expire    state            source               virtual             destination      flags 
+==========================================================================================================================
+0      TCP    1:40 ESTABLISHED     10.1.1.1:11111        10.2.2.2:22222        10.3.3.3:33333    DROUTE NOOUTPUT
+0      TCP    1:40 ESTABLISHED     10.1.1.1:11111        10.2.2.2:22222        10.3.3.3:33333    DROUTE NOOUTPUT
+0      TCP    1:40 ESTABLISHED     10.1.1.1:11111        10.2.2.2:22222        10.3.3.3:33333    DROUTE NOOUTPUT
+
+Reference for packet structure:
+http://lxr.free-electrons.com/source/net/netfilter/ipvs/ip_vs_sync.c
+
+Author: Louis-Philippe Theriault (lpther@gmail.com)
 """
 import fcntl
+import math
 import select
 import socket
 import struct
@@ -9,16 +50,19 @@ import string
 import sys
 import time
 
-# lvs sync constants
-LVSSYNC_MIN_SLEEP = 0.25    # In debugging mode, how much time to sleep before checking the buffer
-FQDN_NR = False              # Set to True for fully qualified name resolution
+# lvssync constants
+LVSSYNC_MIN_SLEEP = 0.25            # In debugging mode, how much time to sleep before checking the buffer
+LVSSYNC_FQDN_NR = False                     # Set to True for fully qualified name resolution
+LVSSYNC_DEBUG_TIME_FMT  =   "%c"    # To prefix debugging entries
 
-# ipvs sync constants
+# ip_vs_sync constants
 MCAST_GRP = '224.0.0.81'
+MCAST_GRP_TTL = 1
 MCAST_PORT = 8848
 
 IP_VS_CONN_HDRLEN       = 8
 IP_VS_CONN_CONNHDRLEN   = 8
+IP_VS_CONN_CONNLEN      = 36 # Without parameters
 
 IP_VS_CONN_F_MASQ       = {'flag': 0x0000 , 'flagname': "MASQ" }
 IP_VS_CONN_F_LOCALNODE  = {'flag': 0x0001 , 'flagname': "LOCALNODE" }
@@ -57,11 +101,83 @@ class ipvssync(object):
     def __init__(self, syncid, interface=None):
         self.interface = interface
         self.interfaceaddress = None
+        self.interfacemtu = 1500
+        self.maxmcastmessage = self.interfacemtu - 68 # Safe header room for IP + UDP
         self.syncid = syncid
         self.socket = None
         self.socketisblocking = None
         self.recvbuffer = ""
         self.sendbuffer = ""
+
+    def getsendconnlistduration(self, connlist, connspersec=250):
+        """
+        Returns the number of seconds if should take to send this list of connections
+        """
+        maxconnpermessage = int(math.floor((self.maxmcastmessage - IP_VS_CONN_HDRLEN) / IP_VS_CONN_CONNLEN))
+        maxconnpermessage = min(maxconnpermessage,connspersec)
+
+        return int(math.ceil(float(len(connlist)) / connspersec)) - 1 
+        
+
+    def sendconnlist(self, connlist, connspersec=250):
+        """
+        Sends the connlist of connections to the lvs mcast group,
+        to update all lvs on the network
+
+        connlist    list    [conn, conn, ... conn]
+        connspersec int     Upper limit of connections per second to transmit
+
+        conn        dict    {   "protocol"      : int of socket.SOL_TCP | socket.SOL_UDP | other ... ,
+                                "director_type" : str in IP_VS_F_FWD_METHOD
+                                "timeout"       : int in seconds
+                                "cport"         : int client tcp port
+                                "vport"         : int virtual tcp port
+                                "dport"         : int destination tcp port
+                                "caddr"         : str client ipv4 addr in dotted quad
+                                "vaddr"         : str virtual ipv4 addr in dotted quad
+                                "daddr"         : str destination ipv4 addr in dotted quad
+                            }
+        """
+        if self.socket == None:
+            self.__initsocket()
+
+        maxconnpermessage = int(math.floor((self.maxmcastmessage - IP_VS_CONN_HDRLEN) / IP_VS_CONN_CONNLEN))
+        maxconnpermessage = min(maxconnpermessage,connspersec)
+
+        nr_sent_this_second = 0
+        last_sent_time = time.time()
+
+        while True:
+            if len(connlist) == 0:
+                break
+            elif nr_sent_this_second >= connspersec:
+                time.sleep(LVSSYNC_MIN_SLEEP)
+
+                now = time.time()
+                if now - last_sent_time > 1.0:
+                    nr_sent_this_second = 0
+            else:
+                nr_conns = min(len(connlist),maxconnpermessage)
+                
+                # Generate the buffer data for the connections to send with this message
+                buffconns = self.__encode_connlist(connlist[:nr_conns])
+
+                reserved    =   0
+                syncid      =   self.syncid
+                size        =   socket.htons(IP_VS_CONN_HDRLEN + len(buffconns))
+                version     =   1
+                spare       =   0
+
+                buffhdr = struct.pack("BBHBbH",reserved,syncid,size,nr_conns,version,spare)
+
+                self.socket.sendto(buffhdr+buffconns, (MCAST_GRP,MCAST_PORT))
+
+                nr_sent_this_second += nr_conns
+                last_sent_time = time.time()
+                connlist = connlist[nr_conns:]
+
+        self.__shutsocket()
+
 
     def debug(self, duration, fd=sys.stdout, printdate=False, nameresolution=False):
         """
@@ -105,7 +221,7 @@ class ipvssync(object):
                         size = socket.ntohs(rawsize)
 
                         header = {}
-                        header["reserved"] = rawsize
+                        header["reserved"] = reserved
                         header["syncid"] = syncid
                         header["size"] = size
                         header["nr_conns"] = nr_conns
@@ -118,7 +234,7 @@ class ipvssync(object):
                             numpackets += 1
                             numconnections += len(conns)
 
-                            self.__print_conns(fd,header,conns,nameresolution=nameresolution)
+                            self.__print_conns(fd,header,conns,nameresolution=nameresolution,printdate=printdate)
     
                             self.recvbuffer = self.recvbuffer[header["size"]:]
                         else:
@@ -134,10 +250,10 @@ class ipvssync(object):
             duration = time.time() - starttime
             pass
     
-        print self.recvbuffer
-
         print >>fd, "Received %s packets (%s total connections) during %.2f seconds" % (numpackets, numconnections, duration)
-   
+
+        self.__shutsocket()
+
     def __getipaddr(self, interface):
         """
         Return the associated ip address from interface
@@ -148,7 +264,7 @@ class ipvssync(object):
         return socket.inet_ntoa( \
             fcntl.ioctl( s.fileno(), SIOCGIFADDR, struct.pack('256s', interface[:15])) \
             [20:24])
-        s.shutdown()
+        s.close()
 
 
     def __initsocket(self, blocking=True):
@@ -166,6 +282,7 @@ class ipvssync(object):
 
         # Set options
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MCAST_GRP_TTL)
 
         self.socket.bind(("", MCAST_PORT))
 
@@ -174,6 +291,13 @@ class ipvssync(object):
 
         if not blocking:
             self.socket.setblocking(0)
+
+    def __shutsocket(self):
+        """
+        """
+        self.socket.close()
+        self.socket = None
+        self.socketisblocking = None
 
     def __decode_conns(self, rawconns):
         """
@@ -186,7 +310,7 @@ class ipvssync(object):
                 break
             else:
                 conn_type, protocol, ver_size, flags, state, cport, vport, dport, fwmark, timeout, caddr, vaddr, daddr \
-                    = struct.unpack("BBHIHHHHIIIII",rawconns[:36])
+                    = struct.unpack("BBHIHHHHIIIII",rawconns[:IP_VS_CONN_CONNLEN])
                 conn_size = socket.ntohs(ver_size) & 0b0000111111111111
                 conn_ver = socket.ntohs(ver_size) >> 12 
 
@@ -197,10 +321,10 @@ class ipvssync(object):
                 this_conn["size"] = conn_size
                 this_conn["flags"] = self.__decode_flags(socket.ntohl(flags))
                 this_conn["state"] = IP_VS_TCP_S_CONNECTION_STATES[socket.ntohs(state)]
-                this_conn["timeout"] = int(socket.ntohl(timeout))
                 this_conn["cport"] = socket.ntohs(cport)
                 this_conn["vport"] = socket.ntohs(vport)
                 this_conn["dport"] = socket.ntohs(dport)
+                this_conn["timeout"] = int(socket.ntohl(timeout))
                 this_conn["caddr"] = self.__unsigned_int_to_ip(socket.ntohl(caddr))
                 this_conn["vaddr"] = self.__unsigned_int_to_ip(socket.ntohl(vaddr))
                 this_conn["daddr"] = self.__unsigned_int_to_ip(socket.ntohl(daddr))
@@ -211,6 +335,36 @@ class ipvssync(object):
                 rawconns = rawconns[conn_size:]
 
         return conns
+
+    def __encode_connlist(self, connlist):
+        """
+        """
+        buffer = ""
+
+        for c in connlist:
+            # Conn header
+            conn_type   = 0
+            protocol    = c["protocol"]
+            conn_ver    = 0
+            conn_size   = struct.calcsize("BBHIHHHHIIIII")
+
+            ver_size = (socket.htons(conn_ver) << 12) | socket.htons(conn_size)
+
+            # Conn data
+            flags       = socket.htonl(IP_VS_F_FWD_METHOD.index(c["director_type"]) | self.__encode_flags([IP_VS_CONN_F_NOOUTPUT["flag"]]))
+            state       = socket.htons(IP_VS_TCP_S_CONNECTION_STATES.index("ESTABLISHED"))
+            cport       = socket.htons(c["cport"])
+            vport       = socket.htons(c["vport"])
+            dport       = socket.htons(c["dport"])
+            fwmark      = 0
+            timeout     = socket.htonl(c["timeout"])
+            caddr       = socket.htonl(self.__ip_to_unsigned_int(c["caddr"]))
+            vaddr       = socket.htonl(self.__ip_to_unsigned_int(c["vaddr"]))
+            daddr       = socket.htonl(self.__ip_to_unsigned_int(c["daddr"]))
+
+            buffer += struct.pack("BBHIHHHHIIIII",conn_type,protocol,ver_size,flags,state,cport,vport,dport,fwmark,timeout,caddr,vaddr,daddr)
+
+        return buffer
 
     def __decode_flags(self, rawflags):
         """
@@ -225,8 +379,19 @@ class ipvssync(object):
 
         return flags
 
+    def __encode_flags(self, flagslist):
+        """
+        """
+        rawflags = 0x0000
+
+        for f in flagslist:
+            rawflags = rawflags | f
+
+        return rawflags
+
     def __unsigned_int_to_ip(self, unsigned_int):
         """
+        Return dotted quad ip str
         """
         a = (unsigned_int & 0xff000000) >> 24
         b = (unsigned_int & 0x00ff0000) >> 16
@@ -234,6 +399,18 @@ class ipvssync(object):
         d = unsigned_int & 0x000000ff
         return "%s.%s.%s.%s" % (a,b,c,d)
         
+    def __ip_to_unsigned_int(self, dotted_quad_ip):
+        """
+        Return unsigned int from dotted quad
+        """
+        unsigned_int = 0x00000000
+        for quad_id in range(4):
+            quad = dotted_quad_ip.split(".")[quad_id]
+
+            unsigned_int += int(quad) << ((8 * (3 - quad_id)))
+
+        return unsigned_int
+
     def __print_conns(self, fd, header, conns, printdate=False, nameresolution=False):
         """
         """
@@ -260,7 +437,7 @@ class ipvssync(object):
                 try:
                     caddr = socket.gethostbyaddr(caddr)[0]
                     
-                    if not FQDN_NR:
+                    if not LVSSYNC_FQDN_NR:
                         caddr = caddr.split(".")[0]
                 except:
                     pass
@@ -268,7 +445,7 @@ class ipvssync(object):
                 try:
                     vaddr = socket.gethostbyaddr(vaddr)[0]
                     
-                    if not FQDN_NR:
+                    if not LVSSYNC_FQDN_NR:
                         vaddr = vaddr.split(".")[0]
                 except:
                     pass
@@ -276,7 +453,7 @@ class ipvssync(object):
                 try:
                     daddr = socket.gethostbyaddr(daddr)[0]
                     
-                    if not FQDN_NR:
+                    if not LVSSYNC_FQDN_NR:
                         daddr = daddr.split(".")[0]
                 except:
                     pass
@@ -308,7 +485,7 @@ class ipvssync(object):
         """
         """
         if printdate:
-            pass
+            datestring = time.strftime(LVSSYNC_DEBUG_TIME_FMT) + "   "
         else:
             datestring = ""
 
@@ -317,8 +494,14 @@ class ipvssync(object):
 
 
 if __name__ == "__main__":
+    import socket
     import lvssync
     import os
+
+    if "LVSSYNCMODE" in os.environ:
+        mode = os.environ["LVSSYNCMODE"]
+    else:
+        mode = "debug"
 
     if "LVSSYNCNR" in os.environ:
         nameresolution = os.environ["LVSSYNCNR"]
@@ -330,4 +513,33 @@ if __name__ == "__main__":
     else:
         sync = lvssync.ipvssync(0)
 		
-    sync.debug(0,nameresolution=nameresolution)
+    if mode == "debug":
+        sync.debug(0,nameresolution=nameresolution,printdate=True)
+    elif mode == "testsend":
+        connection1 = {  "protocol" : socket.SOL_TCP, "director_type" : "DROUTE", "timeout" : 60, \
+                        "cport"    : 11111, "vport" : 22222, "dport" : 33333, \
+                        "caddr"    : "10.1.1.1", "vaddr" : "10.2.2.2", "daddr" : "10.3.3.3" }
+
+        connection2 = {  "protocol" : socket.SOL_TCP, "director_type" : "DROUTE", "timeout" : 60, \
+                        "cport"    : 11111, "vport" : 22222, "dport" : 33333, \
+                        "caddr"    : "10.10.1.1", "vaddr" : "10.20.2.2", "daddr" : "10.30.3.3" }
+
+        connection3 = {  "protocol" : socket.SOL_TCP, "director_type" : "DROUTE", "timeout" : 60, \
+                        "cport"    : 11111, "vport" : 22222, "dport" : 33333, \
+                        "caddr"    : "10.10.10.1", "vaddr" : "10.20.20.2", "daddr" : "10.30.30.3" }
+
+        conn_list = [connection1,connection2,connection3]
+        connspersec = 1
+        before = time.time()
+
+        duration = sync.getsendconnlistduration(conn_list,connspersec)
+
+        print "Sending %s connections should take around %s sec at %s connections/sec" % (len(conn_list),duration,connspersec)
+        sync.sendconnlist(conn_list, connspersec=connspersec)
+
+        after = time.time()
+        print "... Sending time was %3.2f sec" % (after - before)
+
+    elif mode == "help":
+        help(lvssync)
+        
