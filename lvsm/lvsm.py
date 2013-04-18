@@ -12,6 +12,8 @@ import lvsdirector
 import firewall
 import utils
 import termcolor
+import time
+import os
 
 DEBUG = False
 
@@ -29,9 +31,10 @@ class CommandPrompt(cmd.Cmd):
         self.director = lvsdirector.Director(self.config['director'],
                                              self.config['maintenance_dir'],
                                              self.config['ipvsadm'],
-                                             self.config['director_config'],
-                                             self.config['director_cmd'],
-                                             self.config['nodes'])
+                                             configfile      = self.config['director_config'],
+                                             finalconfigfile = self.config['director_finalconfig'],
+                                             restart_cmd     = self.config['director_cmd'],
+                                             nodes           = self.config['nodes'])
         # disable color if the terminal doesn't support it
         if not sys.stdout.isatty():
             self.settings['color'] = False
@@ -440,6 +443,69 @@ class ConfigurePrompt(CommandPrompt):
                 print "Syncing " + self.config['firewall_config'] + " ..."
                 self.svn_sync(self.config['firewall_config'],
                               username, password)
+        elif self.config['version_control'] == 'rsync':
+            # Backup self.configfile into the self.configdir's archive
+            # and rsync pull the content of self.configdir from all nodes
+            archivedir = "%s/.archive" % self.director.getmaintenancedir()
+            comment_file = "%s/comment.log" % self.director.getmaintenancedir()
+            now = time.gmtime()
+
+
+            # Configdir archive is mandatory
+            try:
+                os.makedirs(archivedir)
+            except OSError as e:
+                # Ignore if dir already exists
+                if e.errno != 17:
+                    raise e
+
+            # Get modification comment
+            comment = time.strftime("%c", now) + "\n______________\n"
+            lastcomment = ""
+            print "Please, indicate the reason why you made a change."
+            print "When you're done, enter . on a new line."
+
+            while True:
+                lastcomment = raw_input(">> ")
+
+                if lastcomment == ".":
+                    break
+                else:
+                    comment += (lastcomment + "\n")
+
+            comment = comment.replace("\\","").replace('"','\\"')
+    
+            utils.check_output(""" echo "%s" >> %s """ % (comment,comment_file), shell=True)
+
+            # Copy config file to archive
+            current_time_file_str = time.strftime("%Y-%m-%d_%H:%M:%S", now)
+            shutil.copy(self.director.getconfigfile(),"%s/%s_%s" % (archivedir,self.director.getconfigfilename(),current_time_file_str))
+
+            # Rsync directories to other nodes
+            rename_cmd = """ cp {maintenancedir}/{configfilename}_{node} {finalconfigfile} """
+            rename_args = {"maintenancedir" : self.director.getmaintenancedir(),
+                           "configfilename" : self.director.getconfigfilename(), "finalconfigfile" : self.director.getfinalconfigfile() }
+            rsync_cmd = """ mkdir -p {maintenancedir} ; rsync -qavrp --delete {pull-from-node}:{maintenancedir} {maintenancedir} ; {rename_cmd}  """
+
+            rsync_args = dict( rename_args.items() )
+            rsync_args["rename_cmd"] = rename_cmd
+
+            print
+            print "Starting synchronization across nodes"
+            print "-------------------------------------"
+
+            for node in self.director.getnodes():
+                rename_args["node"] = node
+                if node == self.director.hostname:
+                    print "%s is local node, copying file only" % node
+                    print
+                    utils.check_output(rename_cmd.format(**rename_args), shell=True)
+                else:
+                    rsync_args["pull-from-node"] = self.director.hostname
+                    print "Pulling config from %s" % node
+                    print 
+                    utils.check_output("ssh %s \"%s\" " % (node,rsync_cmd.format(**rsync_args).format(**rename_args)), shell=True)
+
         else:
             print "You need to define version_control in lvsm.conf"
 
