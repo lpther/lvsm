@@ -25,6 +25,7 @@ def parse_config(filename):
     config_items = {'ipvsadm': 'ipvsadm',
                     'iptables': 'iptables',
                     'director_config': '',
+                    'director_finalconfig': '',
                     'firewall_config': '',
                     'director': '',
                     'maintenance_dir': '',
