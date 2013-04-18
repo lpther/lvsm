@@ -15,8 +15,8 @@ class Director(object):
                  'keepalived': Keepalived}
 
     def __new__(self, name, maintenance_dir, ipvsadm,
-                configfile='', restart_cmd='', nodes=''):
+                configfile='', restart_cmd='', nodes='', finalconfigfile=None):
         if name != 'ldirectord' and name != 'keepalived':
             name = 'generic'
         return Director.directors[name](maintenance_dir, ipvsadm,
-                                        configfile, restart_cmd, nodes)
+                                        configfile, restart_cmd, nodes, finalconfigfile)
