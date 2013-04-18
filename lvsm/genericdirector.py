@@ -24,15 +24,19 @@ class GenericDirector(object):
     Generic class that knows about ipvsadm. If director isn't defined, this
     is the fallback. Should be inherited by classes implementing specific
     director funcationality.
+
+    maintenance_dir     str     lvsm config directory
+    conffigfile         str     director main configfile
     """
     def __init__(self, maintenance_dir, ipvsadm,
-                 configfile='', restart_cmd='', nodes=''):
+                 configfile='', restart_cmd='', nodes='', finalconfigfile=None):
         self.maintenance_dir = maintenance_dir
+
         self.ipvsadm = ipvsadm
 
         self.configfile = configfile
-	self.configfilename = configfile.split("/")[-1]
-	self.configdir = "/".join(configfile.split("/")[:-1]) + "/lvsm/"
+        self.configfilename = configfile.split("/")[-1]
+        self.configfiledir = "/".join(configfile.split("/")[:-1])
 
         self.restart_cmd = restart_cmd
 
@@ -42,27 +46,53 @@ class GenericDirector(object):
         else:
             self.nodes = [self.hostname]
 
-	if self.hostname not in self.nodes:
-		print "[ERROR] Current node not listed in nodes list"
-		sys.exit(1)
+        if finalconfigfile == None:
+            self.finalconfigfile = self.configfile
+        else:
+            self.finalconfigfile = finalconfigfile
+
+        if self.hostname not in self.nodes:
+            print "[ERROR] Current node not listed in nodes list"
+            sys.exit(1)
+
+    def getmaintenancedir(self):
+        """
+        Returns the path to the lvsm working directory
+        """
+        return self.maintenance_dir
 
     def getconfigfile(self):
-	"""
-	Returns the configfile
-	"""
-	return self.configfile
+        """
+        Returns the master configfile
+        """
+        return self.configfile
+
+    def getfinalconfigfile(self):
+        """
+        Returns the final name for the configfile
+
+        Useful if there is a conversion from a template file
+        to a node specific file
+        """
+        return self.configfile
 
     def getconfigdir(self):
-	"""
-	Returns the configdir
-	"""
-	return self.configdir
+        """
+        Returns the configdir
+        """
+        return self.configfiledir
 
     def getconfigfilename(self):
-	"""
-	Returns the configfilename
-	"""
-	return self.configfilename
+        """
+        Returns the configfilename
+        """
+        return self.configfilename
+
+    def getnodes(self):
+        """
+        Returns the list of nodes
+        """
+        return self.nodes
 
     def disable(self, host, port='', reason=''):
         """
